@@ -271,6 +271,83 @@ test("metricsServer.close({ gracePeriodMs: 0 }) force-closes a stalled client im
   );
 });
 
+test("before/after regression: unbounded http.Server.close() hangs on a stalled client while bounded close() completes within gracePeriodMs", async () => {
+  // 1. Reproduced failure on baseline main (unbounded server.close()):
+  // A raw http.Server with a stalled client sending partial headers never
+  // resolves server.close() within the 80ms shutdown budget.
+  const rawServer = http.createServer((_req, res) => {
+    res.writeHead(200);
+    res.end("ok");
+  });
+  await new Promise((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+  const rawPort = rawServer.address().port;
+  const rawStalled = await connectStalledFakeClient(rawPort);
+
+  try {
+    let rawClosed = false;
+    const rawClosePromise = new Promise((resolve) => {
+      rawServer.close(() => {
+        rawClosed = true;
+        resolve("closed");
+      });
+    });
+    const raceOutcome = await Promise.race([
+      rawClosePromise,
+      new Promise((resolve) => setTimeout(() => resolve("timed_out"), 120)),
+    ]);
+    assert.equal(
+      raceOutcome,
+      "timed_out",
+      "unbounded http.Server.close() remains stalled when a client holds an incomplete request open",
+    );
+    assert.equal(rawClosed, false);
+  } finally {
+    rawStalled.destroy();
+    rawServer.closeAllConnections?.();
+  }
+
+  // 2. Fixed behavior with bounded startHealthServer().close():
+  // The same stalled fake client is terminated after the 80ms grace period and
+  // close() resolves cleanly.
+  const boundedServer = startHealthServer({
+    config: baseConfig({ healthPort: 18825, healthShutdownGraceMs: 80 }),
+    status: () => baseStatus(),
+    now: () => 5_500,
+  });
+  const boundedStalled = await connectStalledFakeClient(boundedServer.port);
+  const boundedClosed = once(boundedStalled, "close");
+
+  const boundedOutcome = await Promise.race([
+    boundedServer.close().then(() => "closed"),
+    new Promise((resolve) => setTimeout(() => resolve("timed_out"), 1_000)),
+  ]);
+  assert.equal(boundedOutcome, "closed");
+  await boundedClosed;
+  assert.equal(boundedStalled.destroyed, true);
+});
+
+test("boundary regression: negative or non-finite gracePeriodMs override clamps to 0 and closes immediately", async () => {
+  const server = startHealthServer({
+    config: baseConfig({ healthPort: 18826, healthShutdownGraceMs: 5_000 }),
+    status: () => baseStatus(),
+    now: () => 5_500,
+  });
+
+  const stalledSocket = await connectStalledFakeClient(server.port);
+  const closedPromise = once(stalledSocket, "close");
+
+  const startedAt = Date.now();
+  await server.close({ gracePeriodMs: -50 });
+  const elapsedMs = Date.now() - startedAt;
+
+  await closedPromise;
+  assert.equal(stalledSocket.destroyed, true);
+  assert.ok(
+    elapsedMs < 500,
+    `expected negative gracePeriodMs to clamp to 0 and close immediately; took ${elapsedMs}ms`,
+  );
+});
+
 test("loadConfig: HEALTH_SHUTDOWN_GRACE_MS defaults to 2000 and validates boundaries", () => {
   withEnv(validBotEnv(), () => {
     const config = loadConfig();
