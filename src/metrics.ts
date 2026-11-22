@@ -29,12 +29,15 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 export type MetricLabelErrorCode =
   | "INVALID_METRIC_NAME"
+  | "DUPLICATE_METRIC_NAME"
   | "INVALID_LABEL_KEY"
   | "RESERVED_LABEL_KEY"
   | "UNDECLARED_LABEL_KEY"
   | "MISSING_LABEL_KEY"
   | "NON_STRING_LABEL_VALUE"
-  | "CONTROL_CHARACTER_IN_LABEL_VALUE";
+  | "CONTROL_CHARACTER_IN_LABEL_VALUE"
+  | "NON_STRING_HELP"
+  | "CONTROL_CHARACTER_IN_HELP";
 
 /** Thrown when a metric name, label key, or label value violates exposition safety rules. */
 export class MetricLabelError extends Error {
@@ -113,6 +116,30 @@ export function escapeMetricLabelValue(value: string): string {
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/\n/g, "\\n");
+}
+
+/**
+ * Escape a Prometheus v0.0.4 `# HELP` docstring (`\` -> `\\`, `\n` -> `\n`)
+ * while rejecting disallowed C0/DEL/C1 control characters (`\r`, `\0`, `\x1b`, etc.)
+ * so help text can never break out of the comment line to inject samples.
+ */
+export function escapeMetricHelp(help: string): string {
+  if (typeof help !== "string") {
+    throw new MetricLabelError(
+      "NON_STRING_HELP",
+      `Prometheus HELP text must be a string; got ${typeof help}`,
+    );
+  }
+  const badMatch = DISALLOWED_LABEL_CONTROL_CHAR_RE.exec(help);
+  if (badMatch !== null) {
+    const codePoint = badMatch[0].charCodeAt(0);
+    const hex = `0x${codePoint.toString(16).padStart(2, "0")}`;
+    throw new MetricLabelError(
+      "CONTROL_CHARACTER_IN_HELP",
+      `Prometheus HELP text contains disallowed control character (${hex})`,
+    );
+  }
+  return help.replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
 }
 
 /**
@@ -350,6 +377,10 @@ export function createMetrics(): MetricsRegistry {
     series: Map<string, number>;
   }
   const labeledFamilies: LabeledMetricFamily[] = [];
+  const registeredNames = new Set<string>([
+    ...counters.map((c) => c._name),
+    ...gauges.map((g) => g._name),
+  ]);
 
   function canonicalizeDeclaredLabels(
     declared: readonly string[],
@@ -387,10 +418,18 @@ export function createMetrics(): MetricsRegistry {
     labelNames: readonly string[],
   ): LabeledCounter {
     const validName = validateMetricName(name);
+    if (registeredNames.has(validName)) {
+      throw new MetricLabelError(
+        "DUPLICATE_METRIC_NAME",
+        `Prometheus metric family ${JSON.stringify(validName)} is already registered`,
+      );
+    }
+    const escapedHelp = escapeMetricHelp(help);
     const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    registeredNames.add(validName);
     const family: LabeledMetricFamily = {
       name: validName,
-      help,
+      help: escapedHelp,
       type: "counter",
       labelNames: validKeys,
       series: new Map(),
@@ -417,10 +456,18 @@ export function createMetrics(): MetricsRegistry {
     labelNames: readonly string[],
   ): LabeledGauge {
     const validName = validateMetricName(name);
+    if (registeredNames.has(validName)) {
+      throw new MetricLabelError(
+        "DUPLICATE_METRIC_NAME",
+        `Prometheus metric family ${JSON.stringify(validName)} is already registered`,
+      );
+    }
+    const escapedHelp = escapeMetricHelp(help);
     const validKeys = labelNames.map((k) => validateMetricLabelKey(k));
+    registeredNames.add(validName);
     const family: LabeledMetricFamily = {
       name: validName,
-      help,
+      help: escapedHelp,
       type: "gauge",
       labelNames: validKeys,
       series: new Map(),

@@ -5,6 +5,7 @@ import { buildMetricsReport } from "../dist/health.js";
 import {
   MetricLabelError,
   createMetrics,
+  escapeMetricHelp,
   escapeMetricLabelValue,
   formatMetricLabels,
   validateMetricLabelKey,
@@ -218,5 +219,64 @@ test("renderRpcTimingMetrics and buildMetricsReport neutralize label breakout an
         3_000,
       ),
     (err) => err instanceof MetricLabelError && err.code === "CONTROL_CHARACTER_IN_LABEL_VALUE",
+  );
+});
+
+test("escapeMetricHelp and labeled registration prevent HELP comment breakout and reject controls", () => {
+  assert.equal(escapeMetricHelp("plain help"), "plain help");
+  assert.equal(escapeMetricHelp("a\\b\nc"), "a\\\\b\\nc");
+
+  for (const bad of ["ok\r\ninjected 1", "null\u0000byte", "tab\there", "ansi\u001b[31mred"]) {
+    assert.throws(
+      () => escapeMetricHelp(bad),
+      (err) => err instanceof MetricLabelError && err.code === "CONTROL_CHARACTER_IN_HELP",
+    );
+  }
+
+  const m = createMetrics();
+  // Reproduces the review case: newline in help text must not emit an active sample line
+  const demo = m.registerLabeledCounter(
+    "review_demo_total",
+    "ok\\path\nreview_injected_metric 999",
+    ["route"],
+  );
+  demo.inc({ route: "synthetic" });
+
+  const out = m.render();
+  const lines = out.split("\n");
+  assert.ok(
+    lines.includes("# HELP review_demo_total ok\\\\path\\nreview_injected_metric 999"),
+    "HELP line must escape backslashes and newlines",
+  );
+  assert.equal(
+    lines.some((line) => line.startsWith("review_injected_metric")),
+    false,
+    "injected sample must not escape the # HELP comment line",
+  );
+
+  assert.throws(
+    () => m.registerLabeledGauge("review_bad_help_gauge", "bad\r\ninjected 1", ["route"]),
+    (err) => err instanceof MetricLabelError && err.code === "CONTROL_CHARACTER_IN_HELP",
+  );
+});
+
+test("registerLabeledCounter and registerLabeledGauge reject duplicate metric-family names", () => {
+  const m = createMetrics();
+
+  // Colliding with built-in counter or gauge
+  assert.throws(
+    () => m.registerLabeledCounter("mimir_bot_poll_cycles_total", "dup", ["route"]),
+    (err) => err instanceof MetricLabelError && err.code === "DUPLICATE_METRIC_NAME",
+  );
+  assert.throws(
+    () => m.registerLabeledGauge("mimir_bot_consecutive_failures", "dup", ["route"]),
+    (err) => err instanceof MetricLabelError && err.code === "DUPLICATE_METRIC_NAME",
+  );
+
+  // Colliding with a previously registered custom family
+  m.registerLabeledCounter("mimir_bot_custom_unique_total", "first", ["route"]);
+  assert.throws(
+    () => m.registerLabeledGauge("mimir_bot_custom_unique_total", "second", ["route"]),
+    (err) => err instanceof MetricLabelError && err.code === "DUPLICATE_METRIC_NAME",
   );
 });
